@@ -1,0 +1,309 @@
+import os
+from os.path import join
+import yaml
+import itertools
+import pandas as pd
+
+# Set directories
+WORKDIR = config["workdir"]
+RESULTSDIR = join(WORKDIR,"results")
+SCRIPTSDIR = config["scriptsdir"]
+
+with open(config["tools"]) as f:
+    TOOLS = yaml.safe_load(f)
+
+# Load sample sheet
+sample_sheet = pd.read_csv(config["sample_sheet"])
+SAMPLES = sample_sheet['Sample']
+SAMPLE_TO_R1 = dict(zip(sample_sheet['Sample'], sample_sheet['R1']))
+SAMPLE_TO_R2 = dict(zip(sample_sheet['Sample'], sample_sheet['R2']))
+
+rule all:
+    input:
+        expand(join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam.bai"), sample=SAMPLES),
+        expand(join(RESULTSDIR, "stringtie", "{sample}", "{sample}.gtf"), sample=SAMPLES),
+        join(RESULTSDIR, "qc", "multiqc_report.html")
+
+rule trim:
+    """Trim adapters and low quality bases from paired-end reads with cutadapt (uses RENEE parameters)"""
+    input:
+        r1 = lambda wildcards: join(config["rawdir"], SAMPLE_TO_R1[wildcards.sample]),
+        r2 = lambda wildcards: join(config["rawdir"], SAMPLE_TO_R2[wildcards.sample])
+    output:
+        r1 = join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2 = join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"),
+        report = join(RESULTSDIR, "qc", "cutadapt", "{sample}.cutadapt.log")
+    params:
+        adapter_r1 = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",
+        adapter_r2 = "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT",
+        min_quality = "10,10",
+        min_length = "35:35"
+    envmodules:
+        TOOLS["cutadapt"]
+    shell:
+        """
+        cutadapt \
+            -a {params.adapter_r1} \
+            -A {params.adapter_r2} \
+            --nextseq-trim=2 --trim-n \
+            -n 5 -O 5 \
+            -q {params.min_quality} \
+            -m {params.min_length} \
+            -o {output.r1} -p {output.r2} \
+            --cores $SLURM_CPUS_PER_TASK \
+            {input.r1} {input.r2} > {output.report}
+        """
+
+rule fastqc:
+    """Run FastQC on the trimmed reads"""
+    input:
+        r1 = join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2 = join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz")
+    output:
+        r1 = join(RESULTSDIR, "qc", "fastqc", "{sample}_R1.trimmed_fastqc.zip"),
+        r2 = join(RESULTSDIR, "qc", "fastqc", "{sample}_R2.trimmed_fastqc.zip")
+    params:
+        outdir = join(RESULTSDIR, "qc", "fastqc")
+    envmodules:
+        TOOLS["fastqc"]
+    shell:
+        """
+        fastqc -o {params.outdir} -t $SLURM_CPUS_PER_TASK {input.r1} {input.r2}
+        """
+
+rule star_index:
+    """Build a STAR genome index from the reference genome and GENCODE annotation"""
+    input:
+        fa = config["reference_fasta"],
+        gtf = config["reference_gtf"]
+    output:
+        join(RESULTSDIR, "star_index", "SA")
+    params:
+        outdir = join(RESULTSDIR, "star_index"),
+        overhang = config["read_length"] - 1
+    envmodules:
+        TOOLS["STAR"]
+    shell:
+        """
+        STAR \
+            --runMode genomeGenerate \
+            --genomeDir {params.outdir} \
+            --genomeFastaFiles {input.fa} \
+            --sjdbGTFfile {input.gtf} \
+            --sjdbOverhang {params.overhang} \
+            --outFileNamePrefix {params.outdir}/ \
+            --runThreadN $SLURM_CPUS_PER_TASK
+        """
+
+# STAR 2-pass alignment (based on RENEE)
+
+rule star1p:
+    """First pass STAR alignment to collect novel splice junctions per sample"""
+    input:
+        r1 = join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2 = join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"),
+        index = join(RESULTSDIR, "star_index", "SA")
+    output:
+        sj = join(RESULTSDIR, "star_pass1", "{sample}.SJ.out.tab")
+    params:
+        index = join(RESULTSDIR, "star_index"),
+        prefix = join(RESULTSDIR, "star_pass1", "{sample}.")
+    envmodules:
+        TOOLS["STAR"]
+    shell:
+        """
+        tmp=$(mktemp -d -p /lscratch/$SLURM_JOB_ID)
+        trap 'rm -rf "$tmp"' EXIT
+
+        STAR \
+            --genomeDir {params.index} \
+            --readFilesIn {input.r1} {input.r2} \
+            --readFilesCommand zcat \
+            --outFileNamePrefix {params.prefix} \
+            --outSAMtype None \
+            --outFilterIntronMotifs RemoveNoncanonicalUnannotated \
+            --outSAMstrandField intronMotif \
+            --outFilterType BySJout \
+            --outFilterMultimapNmax 20 \
+            --alignSJoverhangMin 8 \
+            --alignSJDBoverhangMin 1 \
+            --outFilterMismatchNmax 999 \
+            --outFilterMismatchNoverLmax 0.3 \
+            --alignIntronMin 20 \
+            --alignIntronMax 1000000 \
+            --alignMatesGapMax 1000000 \
+            --alignEndsProtrude 10 ConcordantPair \
+            --peOverlapNbasesMin 10 \
+            --outTmpDir $tmp/STARtmp \
+            --runThreadN $SLURM_CPUS_PER_TASK
+        """
+
+rule sjdb:
+    """Collect the filtered set of splice junctions detected across all samples in the first pass"""
+    input:
+        expand(join(RESULTSDIR, "star_pass1", "{sample}.SJ.out.tab"), sample=SAMPLES)
+    output:
+        join(RESULTSDIR, "star_pass1", "uniq.filtered.SJ.out.tab")
+    shell:
+        """
+        cat {input} | \
+            sort | uniq | \
+            awk -F '\\t' '{{if ($5>0 && $7>=3) {{print}}}}' | \
+            cut -f1-4 | sort | uniq | \
+            grep "^chr" | grep -v "^chrM" > {output}
+        """
+
+rule star2p:
+    """Second pass STAR alignment using the splice junctions detected across all samples"""
+    input:
+        r1 = join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
+        r2 = join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"),
+        index = join(RESULTSDIR, "star_index", "SA"),
+        sj = join(RESULTSDIR, "star_pass1", "uniq.filtered.SJ.out.tab")
+    output:
+        bam = join(RESULTSDIR, "bam", "{sample}", "{sample}.Aligned.out.bam"),
+        counts = join(RESULTSDIR, "bam", "{sample}", "{sample}.ReadsPerGene.out.tab"),
+        log = join(RESULTSDIR, "bam", "{sample}", "{sample}.Log.final.out")
+    params:
+        index = join(RESULTSDIR, "star_index"),
+        prefix = join(RESULTSDIR, "bam", "{sample}", "{sample}."),
+        overhang = config["read_length"] - 1
+    envmodules:
+        TOOLS["STAR"]
+    shell:
+        """
+        tmp=$(mktemp -d -p /lscratch/$SLURM_JOB_ID)
+        trap 'rm -rf "$tmp"' EXIT
+
+        STAR \
+            --genomeDir {params.index} \
+            --readFilesIn {input.r1} {input.r2} \
+            --readFilesCommand zcat \
+            --outFileNamePrefix {params.prefix} \
+            --sjdbFileChrStartEnd {input.sj} \
+            --sjdbOverhang {params.overhang} \
+            --limitSjdbInsertNsj 4000000 \
+            --outSAMtype BAM Unsorted \
+            --outSAMattributes NH HI AS nM NM MD \
+            --quantMode GeneCounts \
+            --outFilterIntronMotifs RemoveNoncanonicalUnannotated \
+            --outSAMstrandField intronMotif \
+            --outFilterType BySJout \
+            --outFilterMultimapNmax 20 \
+            --alignSJoverhangMin 8 \
+            --alignSJDBoverhangMin 1 \
+            --outFilterMismatchNmax 999 \
+            --outFilterMismatchNoverLmax 0.3 \
+            --alignIntronMin 20 \
+            --alignIntronMax 1000000 \
+            --alignMatesGapMax 1000000 \
+            --alignEndsProtrude 10 ConcordantPair \
+            --peOverlapNbasesMin 10 \
+            --outTmpDir $tmp/STARtmp \
+            --runThreadN $SLURM_CPUS_PER_TASK
+        """
+
+rule sort_index:
+    """Coordinate sort and index the STAR alignments"""
+    input:
+        join(RESULTSDIR, "bam", "{sample}", "{sample}.Aligned.out.bam")
+    output:
+        bam = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam"),
+        bai = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam.bai"),
+        stats = join(RESULTSDIR, "qc", "samtools", "{sample}.flagstat.txt")
+    params:
+        tmp = join("/lscratch", "$SLURM_JOB_ID", "{sample}")
+    envmodules:
+        TOOLS["samtools"]
+    shell:
+        """
+        samtools sort -@ $SLURM_CPUS_PER_TASK -T {params.tmp} -o {output.bam} {input}
+        samtools index -@ $SLURM_CPUS_PER_TASK {output.bam}
+        samtools flagstat -@ $SLURM_CPUS_PER_TASK {output.bam} > {output.stats}
+        """
+
+rule gtf_to_bed12:
+    """Convert the reference annotation to BED12 for RSeQC"""
+    input:
+        config["reference_gtf"]
+    output:
+        join(RESULTSDIR, "qc", "strandedness", "reference.bed12")
+    envmodules:
+        TOOLS["ucsc"]
+    shell:
+        """
+        gtfToGenePred -genePredExt -ignoreGroupsWithoutExons {input} /dev/stdout | \
+            genePredToBed /dev/stdin {output}
+        """
+
+rule strandedness:
+    """Infer library strandedness with RSeQC"""
+    input:
+        bam = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam"),
+        bai = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam.bai"),
+        bed = join(RESULTSDIR, "qc", "strandedness", "reference.bed12")
+    output:
+        infer = join(RESULTSDIR, "qc", "strandedness", "{sample}.infer_experiment.txt"),
+        flag = join(RESULTSDIR, "qc", "strandedness", "{sample}.stringtie_flag.txt")
+    envmodules:
+        TOOLS["rseqc"]
+    shell:
+        """
+        infer_experiment.py -r {input.bed} -i {input.bam} -s 400000 > {output.infer}
+
+        # RSeQC reports the fraction of reads explained by each pair orientation
+        awk '
+            /1\+\+,1--/ {{ fr = $NF }}
+            /1\+-,1-\+/ {{ rf = $NF }}
+            END {{
+                if (fr > 0.8) print "--fr"
+                else if (rf > 0.8) print "--rf"
+                else print ""
+            }}' {output.infer} > {output.flag}
+        """
+
+rule stringtie:
+    """Assemble transcripts from the sorted alignments with StringTie"""
+    input:
+        bam = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam"),
+        bai = join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam.bai"),
+        flag = join(RESULTSDIR, "qc", "strandedness", "{sample}.stringtie_flag.txt")
+    output:
+        gtf = join(RESULTSDIR, "stringtie", "{sample}", "{sample}.gtf"),
+        abundance = join(RESULTSDIR, "stringtie", "{sample}", "{sample}.gene_abundance.tsv")
+    params:
+        gtf = config["reference_gtf"]
+    envmodules:
+        TOOLS["stringtie"]
+    shell:
+        """
+        strand=$(cat {input.flag})
+
+        stringtie {input.bam} $strand \
+            -G {params.gtf} \
+            -o {output.gtf} \
+            -A {output.abundance} \
+            -m 200 \
+            -l {wildcards.sample} \
+            -p $SLURM_CPUS_PER_TASK
+        """
+
+rule multiqc:
+    """Aggregate trimming, FastQC, alignment, and assembly QC into a single report"""
+    input:
+        cutadapt = expand(join(RESULTSDIR, "qc", "cutadapt", "{sample}.cutadapt.log"), sample=SAMPLES),
+        fastqc = expand(join(RESULTSDIR, "qc", "fastqc", "{sample}_R{read}.trimmed_fastqc.zip"), sample=SAMPLES, read=["1","2"]),
+        star = expand(join(RESULTSDIR, "bam", "{sample}", "{sample}.Log.final.out"), sample=SAMPLES),
+        stats = expand(join(RESULTSDIR, "qc", "samtools", "{sample}.flagstat.txt"), sample=SAMPLES),
+        strand = expand(join(RESULTSDIR, "qc", "strandedness", "{sample}.infer_experiment.txt"), sample=SAMPLES)
+    output:
+        join(RESULTSDIR, "qc", "multiqc_report.html")
+    params:
+        outdir = join(RESULTSDIR, "qc"),
+        searchdir = RESULTSDIR
+    envmodules:
+        TOOLS["multiqc"]
+    shell:
+        """
+        multiqc --force --ignore "*/star_pass1/*" --outdir {params.outdir} {params.searchdir}
+        """

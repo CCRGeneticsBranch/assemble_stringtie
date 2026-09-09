@@ -1,0 +1,18 @@
+workdir:
+    WORKDIR
+rawdir:
+    /data/khanlab3/gb_omics/projects/caplen/ccrgb_96/raw/Illumina/khan_normals/
+scriptsdir:
+    PIPELINE_HOME/workflow/scripts/
+sample_sheet:
+    WORKDIR/config/samples.tsv
+tools:
+    PIPELINE_HOME/resources/tools.yaml
+cluster:
+    PIPELINE_HOME/workflow/cluster.yaml
+reference_gtf:
+    /data/khanlab3/gb_omics/resources/gencode/gencode.v41.annotation.gtf
+reference_fasta:
+    /data/khanlab3/gb_omics/resources/genomes/hg38/hg38_main.fa
+read_length:
+    101

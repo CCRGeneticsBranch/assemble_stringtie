@@ -1,0 +1,8 @@
+cutadapt: "cutadapt"
+fastqc: "fastqc"
+multiqc: "multiqc"
+STAR: "STAR/2.7.11b"
+samtools: "samtools"
+stringtie: "stringtie"
+rseqc: "rseqc/5.0.4"
+ucsc: "ucsc"
