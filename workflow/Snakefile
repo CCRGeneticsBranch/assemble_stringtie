@@ -13,7 +13,7 @@ with open(config["tools"]) as f:
     TOOLS = yaml.safe_load(f)
 
 # Load sample sheet
-sample_sheet = pd.read_csv(config["sample_sheet"])
+sample_sheet = pd.read_csv(config["sample_sheet"], sep='\t')
 SAMPLES = sample_sheet['Sample']
 SAMPLE_TO_R1 = dict(zip(sample_sheet['Sample'], sample_sheet['R1']))
 SAMPLE_TO_R2 = dict(zip(sample_sheet['Sample'], sample_sheet['R2']))
@@ -22,6 +22,8 @@ rule all:
     input:
         expand(join(RESULTSDIR, "bam", "{sample}", "{sample}.sorted.bam.bai"), sample=SAMPLES),
         expand(join(RESULTSDIR, "stringtie", "{sample}", "{sample}.gtf"), sample=SAMPLES),
+        expand(join(RESULTSDIR, "stringtie", "{sample}", "{sample}.fa"), sample=SAMPLES),
+        expand(join(RESULTSDIR, "blastdb", "{sample}"), sample=SAMPLES),
         join(RESULTSDIR, "qc", "multiqc_report.html")
 
 rule trim:
@@ -30,8 +32,8 @@ rule trim:
         r1 = lambda wildcards: join(config["rawdir"], SAMPLE_TO_R1[wildcards.sample]),
         r2 = lambda wildcards: join(config["rawdir"], SAMPLE_TO_R2[wildcards.sample])
     output:
-        r1 = join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz"),
-        r2 = join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz"),
+        r1 = temp(join(RESULTSDIR, "trimmed", "{sample}_R1.trimmed.fastq.gz")),
+        r2 = temp(join(RESULTSDIR, "trimmed", "{sample}_R2.trimmed.fastq.gz")),
         report = join(RESULTSDIR, "qc", "cutadapt", "{sample}.cutadapt.log")
     params:
         adapter_r1 = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",
@@ -161,7 +163,7 @@ rule star2p:
         index = join(RESULTSDIR, "star_index", "SA"),
         sj = join(RESULTSDIR, "star_pass1", "uniq.filtered.SJ.out.tab")
     output:
-        bam = join(RESULTSDIR, "bam", "{sample}", "{sample}.Aligned.out.bam"),
+        bam = temp(join(RESULTSDIR, "bam", "{sample}", "{sample}.Aligned.out.bam")),
         counts = join(RESULTSDIR, "bam", "{sample}", "{sample}.ReadsPerGene.out.tab"),
         log = join(RESULTSDIR, "bam", "{sample}", "{sample}.Log.final.out")
     params:
@@ -286,6 +288,36 @@ rule stringtie:
             -m 200 \
             -l {wildcards.sample} \
             -p $SLURM_CPUS_PER_TASK
+        """
+
+rule gtf_to_fasta:
+    """Extract transcript FASTA sequences from a per-sample StringTie GTF"""
+    input:
+        gtf = join(RESULTSDIR, "stringtie", "{sample}", "{sample}.gtf"),
+        fa = config["reference_fasta"]
+    output:
+        fasta = join(RESULTSDIR, "stringtie", "{sample}", "{sample}.fa")
+    envmodules:
+        TOOLS["gffread"]
+    shell:
+        """
+        gffread -g {input.fa} -w {output.fasta} {input.gtf} 
+        """
+
+rule fasta_to_blastdb:
+    """Create a nucleotide BLAST database from a per-sample transcript FASTA"""
+    input:
+        fasta = join(RESULTSDIR, "stringtie", "{sample}", "{sample}.fa")
+    output:
+        db = directory(join(RESULTSDIR, "blastdb", "{sample}"))
+    params:
+        prefix = join(RESULTSDIR, "blastdb", "{sample}", "{sample}")
+    envmodules:
+        TOOLS["blast"]
+    shell:
+        """
+        mkdir -p {output.db}
+        makeblastdb -in {input.fasta} -dbtype nucl -out {params.prefix} -parse_seqids
         """
 
 rule multiqc:

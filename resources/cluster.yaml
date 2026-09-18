@@ -48,6 +48,16 @@ stringtie:
     threads: 8
     time: 00-08:00:00
 
+gtf_to_fasta:
+    mem: 12g
+    threads: 2
+    time: 00-02:00:00
+
+fasta_to_blastdb:
+    mem: 12g
+    threads: 2
+    time: 00-02:00:00
+
 gtf_to_bed12:
     mem: 12g
     time: 00-01:00:00
